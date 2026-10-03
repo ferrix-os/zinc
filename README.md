@@ -6,6 +6,11 @@ A zsh-compatible shell, written in Rust. The name is *zinc*, a metal beside
 ferrous, and the Z of zsh. The acceptance criterion is that oh-my-zsh runs in
 it.
 
+![zinc running oh-my-zsh's agnoster prompt on Ferrix, in a git repository, with uname, ps, svc, df, git and curl](docs/screenshots/terminal-omz.png)
+
+*zinc with oh-my-zsh's agnoster theme on Ferrix (x86-64 under KVM), 2026-10-03.
+[How the screenshot was made](https://github.com/ferrix-os/ferrix/blob/main/docs/brand/screenshots/CAPTIONS.md).*
+
 It lives in the Ferrix tree but stands alone, as ferrousli does: its own cargo
 workspace, a std Linux program whose one dependency is `libc`, reaching the
 kernel only through Linux system calls. zsh 5.9 is the reference, and each

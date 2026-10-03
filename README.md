@@ -1,5 +1,7 @@
 # zinc
 
+> A component of [Ferrix](https://github.com/ferrix-os/ferrix), checked out at `src/user/system/linux/zinc` (its `components.toml`); build and test it from there with `cargo xtask`. Ferrix's [conventions](https://github.com/ferrix-os/ferrix/blob/main/docs/CONVENTIONS.md) apply, including one author per commit.
+
 A zsh-compatible shell, written in Rust. The name is *zinc*, a metal beside
 ferrous, and the Z of zsh. The acceptance criterion is that oh-my-zsh runs in
 it.

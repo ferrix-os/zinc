@@ -283,86 +283,128 @@ impl Shell {
     }
 }
 
-/// Interpret echo/print escapes. Returns the text and whether `\c` ended it.
-fn escapes(s: &[u8]) -> (Vec<u8>, bool) {
-    let mut outb = Vec::new();
-    let mut i = 0;
-    while let Some(&c) = s.get(i) {
-        i += 1;
-        if c != b'\\' {
-            outb.push(c);
-            continue;
+/// Which builtin's backslash escapes a string is read with. They agree on
+/// the single-letter escapes and differ, the way zsh's do, on octal and on a
+/// backslash before anything else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Escapes {
+    /// `echo` and printf's `%b`: an octal byte is `\0` and up to three
+    /// digits after it (POSIX's `\0ddd`), and an unknown escape is left as
+    /// it is, backslash included.
+    Echo,
+    /// `print`: an octal byte is one to three digits, and an unknown
+    /// escape is the character without its backslash.
+    Print,
+    /// printf's format operand: an octal byte is one to three digits
+    /// (POSIX's `\ddd`), and an unknown escape is left as it is.
+    Format,
+}
+
+/// Decode the escape whose backslash is at `s[i]`, appending its bytes to
+/// `out`. Returns the index after it, or `None` for `\c`, which ends the
+/// output.
+fn escape_at(s: &[u8], i: usize, mode: Escapes, out: &mut Vec<u8>) -> Option<usize> {
+    let Some(&e) = s.get(i + 1) else {
+        // A backslash at the very end stands for itself.
+        out.push(b'\\');
+        return Some(i + 1);
+    };
+    let simple = match e {
+        b'a' => Some(7),
+        b'b' => Some(8),
+        b'e' | b'E' => Some(27),
+        b'f' => Some(12),
+        b'n' => Some(b'\n'),
+        b'r' => Some(b'\r'),
+        b't' => Some(b'\t'),
+        b'v' => Some(11),
+        b'\\' => Some(b'\\'),
+        b'"' if mode != Escapes::Echo => Some(b'"'),
+        _ => None,
+    };
+    if let Some(b) = simple {
+        out.push(b);
+        return Some(i + 2);
+    }
+    match e {
+        b'c' => None,
+        b'0'..=b'7' if mode != Escapes::Echo || e == b'0' => {
+            // `\0ddd` counts its digits after the `0`; `\ddd` counts the
+            // first digit as one of its three.
+            let from = if mode == Escapes::Echo { i + 2 } else { i + 1 };
+            let n = s
+                .get(from..)
+                .unwrap_or(&[])
+                .iter()
+                .take(3)
+                .take_while(|d| (b'0'..=b'7').contains(*d))
+                .fold(0u32, |n, d| n * 8 + u32::from(d - b'0'));
+            let len = s
+                .get(from..)
+                .unwrap_or(&[])
+                .iter()
+                .take(3)
+                .take_while(|d| (b'0'..=b'7').contains(*d))
+                .count();
+            // `\400` and above wrap to a byte, as zsh's do.
+            out.push(u8::try_from(n & 0xff).unwrap_or(0));
+            Some(from + len)
         }
-        if s.get(i) == Some(&b'c') {
-            return (outb, true);
-        }
-        let start = i - 1;
-        let mut j = i;
-        while let Some(&n) = s.get(j) {
-            if n == b'\\' {
-                break;
-            }
-            j += 1;
-            if j - i >= 5 {
-                break;
-            }
-        }
-        let chunk: Vec<u8> = [&b"\\"[..], s.get(i..=i).unwrap_or(&[])].concat();
-        let _ = chunk;
-        // Reuse $'...' for one escape at a time.
-        let seq_end = match s.get(i) {
-            Some(b'x') => (i + 3).min(s.len()),
-            Some(b'0') => (i + 4).min(s.len()),
-            Some(b'u') => (i + 5).min(s.len()),
-            Some(b'U') => (i + 9).min(s.len()),
-            Some(_) => i + 1,
-            None => i,
-        };
-        let seq = s.get(start..seq_end).unwrap_or(&[]);
-        let decoded = if s.get(i) == Some(&b'0') {
+        b'x' | b'u' | b'U' => {
+            let max = match e {
+                b'x' => 2,
+                b'u' => 4,
+                _ => 8,
+            };
             let digits: Vec<u8> = s
-                .get(i + 1..seq_end)
+                .get(i + 2..)
                 .unwrap_or(&[])
                 .iter()
                 .copied()
-                .take_while(|d| (b'0'..=b'7').contains(d))
+                .take(max)
+                .take_while(u8::is_ascii_hexdigit)
                 .collect();
-            i += 1 + digits.len();
+            // No digits at all is a NUL byte, as zsh has it.
             let n =
-                u32::from_str_radix(std::str::from_utf8(&digits).unwrap_or("0"), 8).unwrap_or(0);
-            outb.push(u8::try_from(n & 0xff).unwrap_or(0));
-            continue;
-        } else {
-            crate::expand::dollar_quote(seq)
-        };
-        let consumed = match s.get(i) {
-            Some(b'x' | b'u' | b'U') => {
-                let max = match s.get(i) {
-                    Some(b'x') => 2,
-                    Some(b'u') => 4,
-                    _ => 8,
-                };
-                1 + s
-                    .get(i + 1..)
-                    .unwrap_or(&[])
-                    .iter()
-                    .take(max)
-                    .take_while(|d| d.is_ascii_hexdigit())
-                    .count()
+                u32::from_str_radix(std::str::from_utf8(&digits).unwrap_or(""), 16).unwrap_or(0);
+            if e == b'x' {
+                out.push(u8::try_from(n & 0xff).unwrap_or(0));
+            } else {
+                let mut buf = [0u8; 4];
+                let ch = char::from_u32(n).unwrap_or('\u{fffd}');
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             }
-            Some(_) => 1,
-            None => 0,
-        };
-        if consumed == 0 {
-            outb.push(b'\\');
-        } else {
-            let full = s.get(start..i + consumed).unwrap_or(&[]);
-            outb.extend(crate::expand::dollar_quote(full));
-            let _ = decoded;
+            Some(i + 2 + digits.len())
         }
-        i += consumed;
+        _ if mode == Escapes::Print => {
+            out.push(e);
+            Some(i + 2)
+        }
+        _ => {
+            out.push(b'\\');
+            out.push(e);
+            Some(i + 2)
+        }
     }
-    (outb, false)
+}
+
+/// Interpret a string's backslash escapes, byte for byte: a NUL stays in
+/// the result. Returns the text and whether `\c` ended it.
+fn escapes(s: &[u8], mode: Escapes) -> (Vec<u8>, bool) {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while let Some(&c) = s.get(i) {
+        if c != b'\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match escape_at(s, i, mode, &mut out) {
+            Some(next) => i = next,
+            None => return (out, true),
+        }
+    }
+    (out, false)
 }
 
 fn echo(sh: &Shell, args: &[Vec<u8>]) -> i32 {
@@ -384,7 +426,7 @@ fn echo(sh: &Shell, args: &[Vec<u8>]) -> i32 {
     }
     let joined = tok::unmetafy(&args.get(k..).unwrap_or(&[]).join(&b' '));
     let (mut text, stopped) = if interpret {
-        escapes(&joined)
+        escapes(&joined, Escapes::Echo)
     } else {
         (joined, false)
     };
@@ -448,7 +490,11 @@ fn print(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
             a.clone()
         };
         let a = tok::unmetafy(&a);
-        items.push(if raw { a } else { escapes(&a).0 });
+        items.push(if raw {
+            a
+        } else {
+            escapes(&a, Escapes::Print).0
+        });
     }
     let sep: &[u8] = if nul {
         b"\0"
@@ -464,6 +510,287 @@ fn print(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
     i32::from(!write_fd(fd, &text))
 }
 
+/// The flags of one printf conversion, as C's printf reads them.
+#[derive(Clone, Copy, Default, Debug)]
+struct Spec {
+    left: bool,
+    plus: bool,
+    space: bool,
+    alt: bool,
+    zero: bool,
+    width: usize,
+    prec: Option<usize>,
+}
+
+impl Spec {
+    /// Pad a field to the width, counting characters rather than bytes. A
+    /// zero-filled number takes its zeros after its sign and prefix, which
+    /// is `lead` bytes long.
+    fn pad(&self, body: Vec<u8>, zero: bool, lead: usize) -> Vec<u8> {
+        let len = String::from_utf8_lossy(&body).chars().count();
+        let n = self.width.saturating_sub(len);
+        if n == 0 {
+            return body;
+        }
+        let mut out = Vec::with_capacity(body.len() + n);
+        if self.left {
+            out.extend(&body);
+            out.extend(std::iter::repeat_n(b' ', n));
+        } else if zero {
+            out.extend(body.get(..lead).unwrap_or(&[]));
+            out.extend(std::iter::repeat_n(b'0', n));
+            out.extend(body.get(lead..).unwrap_or(&[]));
+        } else {
+            out.extend(std::iter::repeat_n(b' ', n));
+            out.extend(&body);
+        }
+        out
+    }
+
+    /// The sign a non-negative number shows under `+` and ` `.
+    fn plus_sign(&self) -> &'static str {
+        if self.plus {
+            "+"
+        } else if self.space {
+            " "
+        } else {
+            ""
+        }
+    }
+}
+
+/// `%d %i %o %u %x %X`: C's rules for the precision, `#`, `+`, ` ` and `0`.
+fn printf_int(n: i64, conv: u8, spec: &Spec) -> Vec<u8> {
+    let (sign, mut digits, prefix) = match conv {
+        b'd' | b'i' => (
+            if n < 0 { "-" } else { spec.plus_sign() },
+            n.unsigned_abs().to_string(),
+            "",
+        ),
+        _ => {
+            let v = n.cast_unsigned();
+            match conv {
+                b'o' => ("", format!("{v:o}"), ""),
+                b'x' => (
+                    "",
+                    format!("{v:x}"),
+                    if spec.alt && v != 0 { "0x" } else { "" },
+                ),
+                b'X' => (
+                    "",
+                    format!("{v:X}"),
+                    if spec.alt && v != 0 { "0X" } else { "" },
+                ),
+                _ => ("", v.to_string(), ""),
+            }
+        }
+    };
+    if let Some(p) = spec.prec {
+        if p == 0 && n == 0 {
+            digits.clear();
+        }
+        if digits.len() < p {
+            digits = format!("{}{digits}", "0".repeat(p - digits.len()));
+        }
+    }
+    if conv == b'o' && spec.alt && !digits.starts_with('0') {
+        digits.insert(0, '0');
+    }
+    let lead = sign.len() + prefix.len();
+    let body = format!("{sign}{prefix}{digits}").into_bytes();
+    // A precision turns the `0` flag off for an integer, as in C.
+    spec.pad(body, spec.zero && spec.prec.is_none(), lead)
+}
+
+/// `v` in C's `%e` form with `p` digits after the point: an exponent of at
+/// least two digits, always signed.
+fn exp_form(v: f64, p: usize, alt: bool) -> (String, i32) {
+    let s = format!("{v:.p$e}");
+    let (mant, exp) = s.split_once('e').unwrap_or((&s, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let mut mant = mant.to_owned();
+    if alt && !mant.contains('.') {
+        mant.push('.');
+    }
+    let sign = if exp < 0 { '-' } else { '+' };
+    (format!("{mant}e{sign}{:02}", exp.unsigned_abs()), exp)
+}
+
+/// Drop `%g`'s trailing zeros after the point, and the point if nothing is
+/// left after it.
+fn trim_fraction(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_owned();
+    }
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// `%f %F %e %E %g %G`.
+fn printf_float(f: f64, conv: u8, spec: &Spec) -> Vec<u8> {
+    let upper = conv.is_ascii_uppercase();
+    let sign = if f.is_sign_negative() && !f.is_nan() {
+        "-"
+    } else {
+        spec.plus_sign()
+    };
+    let v = f.abs();
+    if !v.is_finite() {
+        let word = if v.is_nan() { "nan" } else { "inf" };
+        let word = if upper {
+            word.to_ascii_uppercase()
+        } else {
+            word.to_owned()
+        };
+        return spec.pad(format!("{sign}{word}").into_bytes(), false, 0);
+    }
+    let p = spec.prec.unwrap_or(6);
+    let digits = match conv.to_ascii_lowercase() {
+        b'e' => exp_form(v, p, spec.alt).0,
+        b'g' => {
+            let p = p.max(1);
+            let x = if v == 0.0 {
+                0
+            } else {
+                exp_form(v, p - 1, false).1
+            };
+            let p_i = i32::try_from(p).unwrap_or(i32::MAX);
+            let s = if x < p_i && x >= -4 {
+                let frac = usize::try_from(p_i - 1 - x).unwrap_or(0);
+                let mut s = format!("{v:.frac$}");
+                if spec.alt && !s.contains('.') {
+                    s.push('.');
+                }
+                s
+            } else {
+                exp_form(v, p - 1, spec.alt).0
+            };
+            if spec.alt {
+                s
+            } else if let Some((m, e)) = s.split_once('e') {
+                format!("{}e{e}", trim_fraction(m))
+            } else {
+                trim_fraction(&s)
+            }
+        }
+        _ => {
+            let mut s = format!("{v:.p$}");
+            if spec.alt && p == 0 {
+                s.push('.');
+            }
+            s
+        }
+    };
+    let digits = if upper {
+        digits.to_ascii_uppercase()
+    } else {
+        digits
+    };
+    let lead = sign.len();
+    spec.pad(format!("{sign}{digits}").into_bytes(), spec.zero, lead)
+}
+
+/// A numeric argument the way zsh reads one: a leading quote gives the code
+/// of the character after it, anything else is an arithmetic expression.
+fn printf_number(sh: &mut Shell, arg: Option<&[u8]>, status: &mut i32) -> i64 {
+    let t = String::from_utf8_lossy(arg.unwrap_or_default())
+        .trim()
+        .to_owned();
+    if t.is_empty() {
+        return 0;
+    }
+    if let Some(rest) = t.strip_prefix('\'').or_else(|| t.strip_prefix('"')) {
+        return rest.chars().next().map_or(0, |c| i64::from(u32::from(c)));
+    }
+    match crate::arith::eval(sh, t.as_bytes()) {
+        Ok(v) => v,
+        // A float such as `1e3` is its integer part, as in zsh.
+        Err(_) if t.parse::<f64>().is_ok_and(f64::is_finite) => {
+            t.parse::<f64>().map_or(0, |f| f as i64)
+        }
+        Err(_) => {
+            sh.error_at("printf", &format!("{t}: invalid number"));
+            *status = 1;
+            0
+        }
+    }
+}
+
+/// A floating argument: a decimal or C float, else arithmetic, as zsh's
+/// `%f` evaluates `1+1`.
+fn printf_double(sh: &mut Shell, arg: Option<&[u8]>, status: &mut i32) -> f64 {
+    let t = String::from_utf8_lossy(arg.unwrap_or_default())
+        .trim()
+        .to_owned();
+    if let Ok(f) = t.parse::<f64>() {
+        return f;
+    }
+    // An i64 beyond f64's exact range loses only its low digits here.
+    printf_number(sh, arg, status) as f64
+}
+
+/// The decimal number at `fmt[*i]`, if any; zero if there is none.
+fn printf_digits(fmt: &[u8], i: &mut usize) -> usize {
+    let mut n = 0usize;
+    while let Some(d) = fmt.get(*i).filter(|d| d.is_ascii_digit()) {
+        n = n.saturating_mul(10).saturating_add(usize::from(d - b'0'));
+        *i += 1;
+    }
+    n
+}
+
+/// Read a directive's flags, width, precision and length modifier, from
+/// just after its `%` to its conversion character. A `*` takes the next
+/// argument.
+fn printf_spec(
+    sh: &mut Shell,
+    fmt: &[u8],
+    i: &mut usize,
+    vals: &[Vec<u8>],
+    next: &mut usize,
+    status: &mut i32,
+) -> Spec {
+    let mut spec = Spec::default();
+    while let Some(&f) = fmt.get(*i) {
+        match f {
+            b'-' => spec.left = true,
+            b'+' => spec.plus = true,
+            b' ' => spec.space = true,
+            b'#' => spec.alt = true,
+            b'0' => spec.zero = true,
+            _ => break,
+        }
+        *i += 1;
+    }
+    if fmt.get(*i) == Some(&b'*') {
+        *i += 1;
+        let w = printf_number(sh, vals.get(*next).map(Vec::as_slice), status);
+        *next += 1;
+        spec.left |= w < 0;
+        spec.width = usize::try_from(w.unsigned_abs()).unwrap_or(usize::MAX);
+    } else {
+        spec.width = printf_digits(fmt, i);
+    }
+    if fmt.get(*i) == Some(&b'.') {
+        *i += 1;
+        if fmt.get(*i) == Some(&b'*') {
+            *i += 1;
+            let p = printf_number(sh, vals.get(*next).map(Vec::as_slice), status);
+            *next += 1;
+            // A negative precision is as if none were given.
+            spec.prec = usize::try_from(p).ok();
+        } else {
+            spec.prec = Some(printf_digits(fmt, i));
+        }
+    }
+    // C's length modifiers mean nothing to a shell; skip them.
+    while fmt.get(*i).is_some_and(|m| b"hlLjzt".contains(m)) {
+        *i += 1;
+    }
+    spec
+}
+
+/// POSIX printf, with zsh's additions (`%q`, `\e`, `\x`, `\u`, `\c` in the
+/// format). Output is byte for byte: a NUL an escape makes is written.
 fn printf(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
     let mut k = 0;
     if args.first().is_some_and(|a| a == b"--") {
@@ -482,18 +809,18 @@ fn printf(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
     let mut outb = Vec::new();
     let mut next = 0usize;
     let mut status = 0;
-    loop {
+    'reuse: loop {
         let consumed_before = next;
         let mut i = 0;
         while let Some(&c) = fmt.get(i) {
-            i += 1;
             if c == b'\\' {
-                let start = i - 1;
-                let (t, _) = escapes(fmt.get(start..(start + 2).min(fmt.len())).unwrap_or(&[]));
-                outb.extend(t);
-                i = (start + 2).min(fmt.len());
+                match escape_at(&fmt, i, Escapes::Format, &mut outb) {
+                    Some(n) => i = n,
+                    None => break 'reuse,
+                }
                 continue;
             }
+            i += 1;
             if c != b'%' {
                 outb.push(c);
                 continue;
@@ -503,97 +830,70 @@ fn printf(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
                 i += 1;
                 continue;
             }
-            let spec_start = i;
-            while fmt.get(i).is_some_and(|c| b"-+ #0123456789.*".contains(c)) {
-                i += 1;
-            }
-            let spec = String::from_utf8_lossy(fmt.get(spec_start..i).unwrap_or(&[])).into_owned();
-            let conv = fmt.get(i).copied().unwrap_or(b's');
-            i += 1;
-            let arg = vals.get(next).cloned();
-            next += 1;
-            let left = spec.contains('-');
-            let zero = spec.starts_with('0') || spec.contains("-0") || spec.contains("+0");
-            let (w, prec) = match spec
-                .trim_start_matches(['-', '+', ' ', '#', '0'])
-                .split_once('.')
-            {
-                Some((w, p)) => (
-                    w.parse::<usize>().unwrap_or(0),
-                    Some(p.parse::<usize>().unwrap_or(0)),
-                ),
-                None => (
-                    spec.trim_start_matches(['-', '+', ' ', '#', '0'])
-                        .parse::<usize>()
-                        .unwrap_or(0),
-                    None,
-                ),
+            let directive_start = i - 1;
+            let spec = printf_spec(sh, &fmt, &mut i, &vals, &mut next, &mut status);
+            let Some(&conv) = fmt.get(i) else {
+                sh.error_at(
+                    "printf",
+                    &format!(
+                        "{}: invalid directive",
+                        String::from_utf8_lossy(fmt.get(directive_start..).unwrap_or(&[]))
+                    ),
+                );
+                status = 1;
+                break 'reuse;
             };
-            let body: Vec<u8> = match conv {
-                b'd' | b'i' | b'u' | b'x' | b'X' | b'o' | b'c' if conv != b'c' => {
-                    let t = String::from_utf8_lossy(&arg.clone().unwrap_or_default())
-                        .trim()
-                        .to_owned();
-                    let n = if t.is_empty() {
-                        0
-                    } else if let Some(ch) = t.strip_prefix('\'').or_else(|| t.strip_prefix('"')) {
-                        ch.chars().next().map_or(0, |c| i64::from(u32::from(c)))
-                    } else {
-                        match crate::arith::eval(sh, t.as_bytes()) {
-                            Ok(v) => v,
-                            Err(_) => {
-                                sh.error_at("printf", &format!("{t}: invalid number"));
-                                status = 1;
-                                0
-                            }
-                        }
-                    };
-                    let s = match conv {
-                        b'x' => format!("{n:x}"),
-                        b'X' => format!("{n:X}"),
-                        b'o' => format!("{n:o}"),
-                        _ => {
-                            if spec.contains('+') && n >= 0 {
-                                format!("+{n}")
-                            } else {
-                                n.to_string()
-                            }
-                        }
-                    };
-                    s.into_bytes()
+            i += 1;
+            if !b"diouxXcsbqfFeEgG".contains(&conv) {
+                sh.error_at(
+                    "printf",
+                    &format!(
+                        "{}: invalid directive",
+                        String::from_utf8_lossy(fmt.get(directive_start..i).unwrap_or(&[]))
+                    ),
+                );
+                status = 1;
+                break 'reuse;
+            }
+            let arg = vals.get(next).map(Vec::as_slice);
+            next += 1;
+            let field = match conv {
+                b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => {
+                    let n = printf_number(sh, arg, &mut status);
+                    printf_int(n, conv, &spec)
                 }
-                b'c' => arg
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .take(1)
-                    .collect(),
-                b'b' => escapes(&arg.clone().unwrap_or_default()).0,
-                b'q' => crate::param::quote_word(&arg.clone().unwrap_or_default()),
-                b'f' | b'e' | b'g' | b'F' | b'E' | b'G' => {
-                    let t = String::from_utf8_lossy(&arg.clone().unwrap_or_default())
-                        .trim()
-                        .to_owned();
-                    let f: f64 = t.parse().unwrap_or(0.0);
-                    format!("{:.*}", prec.unwrap_or(6), f).into_bytes()
+                b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
+                    let f = printf_double(sh, arg, &mut status);
+                    printf_float(f, conv, &spec)
                 }
-                _ => {
-                    let mut s = arg.clone().unwrap_or_default();
-                    if let Some(p) = prec {
+                b'c' => spec.pad(
+                    arg.unwrap_or_default().iter().copied().take(1).collect(),
+                    false,
+                    0,
+                ),
+                b'b' => {
+                    let (mut s, stop) = escapes(arg.unwrap_or_default(), Escapes::Echo);
+                    if let Some(p) = spec.prec {
                         s.truncate(p);
                     }
-                    s
+                    outb.extend(spec.pad(s, false, 0));
+                    if stop {
+                        // `\c` in a `%b` argument ends all of printf's
+                        // output, the rest of the format included.
+                        break 'reuse;
+                    }
+                    continue;
+                }
+                b'q' => spec.pad(crate::param::quote_word(arg.unwrap_or_default()), false, 0),
+                _ => {
+                    let mut s = arg.unwrap_or_default().to_vec();
+                    if let Some(p) = spec.prec {
+                        s.truncate(p);
+                    }
+                    spec.pad(s, false, 0)
                 }
             };
-            let pad = w.saturating_sub(String::from_utf8_lossy(&body).chars().count());
-            if left {
-                outb.extend(&body);
-                outb.extend(std::iter::repeat_n(b' ', pad));
-            } else {
-                let fill = if zero && conv != b's' { b'0' } else { b' ' };
-                outb.extend(std::iter::repeat_n(fill, pad));
-                outb.extend(&body);
-            }
+            outb.extend(field);
         }
         if next >= vals.len() || next == consumed_before {
             break;

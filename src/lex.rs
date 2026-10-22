@@ -259,6 +259,10 @@ pub(crate) struct Lexer {
     pub(crate) noaliases: bool,
     /// `1`: the last newline token ended the input's line; `-1`: more follows.
     pub(crate) isnewlin: i32,
+    /// The input is a file or standard input, which zsh reads a line at a
+    /// time: every newline ends the input it has, so each line is an event
+    /// of its own, parsed only once the one before it has run.
+    pub(crate) by_line: bool,
     /// Set by the lexer when a newline should not become `SEPER`.
     pub(crate) keep_newline: bool,
     /// The current `SEPER` was written `;` rather than as a newline.
@@ -295,6 +299,7 @@ impl Lexer {
             inrepeat: 0,
             noaliases: false,
             isnewlin: 0,
+            by_line: false,
             keep_newline: false,
             sep_was_semi: false,
             toklineno: 1,
@@ -341,7 +346,11 @@ impl Lexer {
         if self.tok != Tok::Newlin {
             self.isnewlin = 0;
         } else {
-            self.isnewlin = if self.input.rest().is_empty() { 1 } else { -1 };
+            self.isnewlin = if self.by_line || self.input.rest().is_empty() {
+                1
+            } else {
+                -1
+            };
         }
         self.sep_was_semi = self.tok == Tok::Semi;
         if self.tok == Tok::Semi || (self.tok == Tok::Newlin && !self.keep_newline) {

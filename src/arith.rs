@@ -131,7 +131,7 @@ impl Arith<'_> {
             skip: self.skip,
             depth: self.depth + 1,
         };
-        let index = inner.comma()?;
+        let index = crate::param::ksh_index(inner.comma()?, self.sh);
         Ok(if index < 0 { len + index + 1 } else { index })
     }
 
@@ -146,7 +146,9 @@ impl Arith<'_> {
         if trimmed.is_empty() {
             return Ok(0);
         }
-        if let Ok(n) = std::str::from_utf8(&trimmed).unwrap_or("x").parse::<i64>() {
+        let octal =
+            self.sh.opt("octalzeroes") && trimmed.len() > 1 && trimmed.first() == Some(&b'0');
+        if !octal && let Ok(n) = std::str::from_utf8(&trimmed).unwrap_or("x").parse::<i64>() {
             return Ok(n);
         }
         if self.depth > 64 {
@@ -486,6 +488,27 @@ impl Arith<'_> {
         let lit = std::str::from_utf8(self.s.get(start..self.i).unwrap_or(&[])).unwrap_or("");
         if lit.is_empty() {
             return Err("bad math expression: operand expected at end of string".to_owned());
+        }
+        // OCTAL_ZEROES, which sh emulation turns on: a leading zero makes
+        // the rest octal, and a digit that is not stops the number there.
+        if self.sh.opt("octalzeroes")
+            && lit.len() > 1
+            && lit.starts_with('0')
+            && lit.bytes().all(|c| c.is_ascii_digit())
+        {
+            let octal = lit
+                .bytes()
+                .take_while(|c| (b'0'..=b'7').contains(c))
+                .count();
+            let (digits, rest) = lit.split_at(octal);
+            if !rest.is_empty() {
+                return Err(format!(
+                    "bad math expression: operator expected at `{rest}'"
+                ));
+            }
+            return i64::from_str_radix(digits, 8)
+                .map(Operand::Num)
+                .map_err(|_| format!("bad math expression: {lit}"));
         }
         parse_number(lit)
             .map(Operand::Num)

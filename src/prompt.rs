@@ -176,6 +176,10 @@ pub(crate) fn expand(sh: &mut Shell, ps: &[u8]) -> Vec<u8> {
     } else {
         ps.to_vec()
     };
+    // PROMPT_PERCENT, off in sh emulation, is what makes `%` an escape.
+    if !sh.opt("promptpercent") {
+        return ps.to_vec();
+    }
     escapes(sh, ps)
 }
 
@@ -317,6 +321,19 @@ fn escapes(sh: &Shell, ps: &[u8]) -> Vec<u8> {
             }
             b'm' | b'M' => out.extend(hostname()),
             b'n' => out.extend(username()),
+            // What is being run and where in it: the file, function or
+            // `zsh`, and the line -- what PS4 shows for `set -x`.
+            b'N' => out.extend(if sh.script.is_empty() {
+                sh.name.as_bytes().to_vec()
+            } else {
+                crate::tok::unmetafy(&sh.script)
+            }),
+            b'i' => out.extend(
+                sh.lineno
+                    .saturating_sub(sh.line_base)
+                    .to_string()
+                    .into_bytes(),
+            ),
             b'?' => out.extend(sh.status.to_string().into_bytes()),
             b'd' | b'/' => out.extend(components(&pwd, num.unwrap_or(0))),
             b'~' => out.extend(components(&contracted(&pwd, &home), num.unwrap_or(0))),

@@ -216,7 +216,38 @@ pub(crate) fn wait_pid(pid: i32) -> i32 {
 
 /// Parse and run `text` (metafied), event by event.
 pub(crate) fn run_string(sh: &mut Shell, text: &[u8]) {
+    run_text(sh, text, false);
+}
+
+/// Run a script file, a sourced file or standard input: as [`run_string`],
+/// but a line at a time, as zsh reads them, so a line runs before the next
+/// is parsed -- what an alias, `emulate` or `setopt` on one line does to
+/// the lines after it shows, and a parse error further down stops the file
+/// only there.
+pub(crate) fn run_file(sh: &mut Shell, text: &[u8]) {
+    run_text(sh, text, true);
+}
+
+/// `eval`: run `text` as `(eval)`, which is what its errors are named, with
+/// lines counted from its own start. An error that stops it stops only it:
+/// the command after the `eval` runs, as in zsh, which clears `errflag` once
+/// `eval` is done. Leaving the shell is not such an error.
+pub(crate) fn eval_string(sh: &mut Shell, text: &[u8]) {
+    let script = std::mem::replace(&mut sh.script, b"(eval)".to_vec());
+    let base = std::mem::replace(&mut sh.line_base, 0);
+    let lineno = sh.lineno;
+    run_string(sh, text);
+    sh.script = script;
+    sh.line_base = base;
+    sh.lineno = lineno;
+    if sh.flow == Flow::Abort {
+        sh.flow = Flow::Normal;
+    }
+}
+
+fn run_text(sh: &mut Shell, text: &[u8], by_line: bool) {
     let mut lx = Lexer::new(text.to_vec(), sh.lex_opts());
+    lx.by_line = by_line;
     loop {
         lx.opts = sh.lex_opts();
         let parsed = {
@@ -450,7 +481,28 @@ pub(crate) fn run_list(sh: &mut Shell, list: &List) {
             return;
         }
         run_item(sh, item);
+        err_exit(sh);
     }
+}
+
+/// ERR_EXIT (`set -e`): a command that failed ends the shell, unless it was
+/// a condition, a part of an `&&`/`||` list before the last, or negated.
+fn err_exit(sh: &mut Shell) {
+    if sh.status != 0
+        && sh.flow == Flow::Normal
+        && sh.noerrexit == 0
+        && !sh.errexit_exempt
+        && sh.opt("errexit")
+    {
+        sh.flow = Flow::Exit;
+    }
+}
+
+/// Run `list` as a condition, where ERR_EXIT does not act.
+fn run_condition(sh: &mut Shell, list: &List) {
+    sh.noerrexit += 1;
+    run_list(sh, list);
+    sh.noerrexit -= 1;
 }
 
 /// Run a list that is the last thing a forked child does before it exits,
@@ -469,6 +521,7 @@ fn run_list_last(sh: &mut Shell, list: &List) {
             return;
         }
         run_item(sh, item);
+        err_exit(sh);
     }
     if sh.flow != Flow::Normal {
         return;
@@ -521,26 +574,45 @@ fn run_item(sh: &mut Shell, item: &ListItem) {
 }
 
 fn run_sublist(sh: &mut Shell, sl: &Sublist) {
-    run_sublist2(sh, &sl.first);
-    for (op, next) in &sl.rest {
+    // Every part but the last is run where ERR_EXIT does not act, and if
+    // the list stops before its last part, its status does not count
+    // either.
+    let n = sl.rest.len();
+    let parts = std::iter::once(&sl.first).chain(sl.rest.iter().map(|(_, next)| next));
+    let ops = std::iter::once(None).chain(sl.rest.iter().map(|(op, _)| Some(*op)));
+    for (k, (op, part)) in ops.zip(parts).enumerate() {
         if sh.flow != Flow::Normal {
             return;
         }
         let go = match op {
-            AndOr::And => sh.status == 0,
-            AndOr::Or => sh.status != 0,
+            None => true,
+            Some(AndOr::And) => sh.status == 0,
+            Some(AndOr::Or) => sh.status != 0,
         };
-        if go {
-            run_sublist2(sh, next);
+        if !go {
+            continue;
         }
+        let last = k == n;
+        if !last {
+            sh.noerrexit += 1;
+        }
+        run_sublist2(sh, part);
+        if !last {
+            sh.noerrexit -= 1;
+        }
+        sh.errexit_exempt = (sh.errexit_exempt && last) || !last || part.not;
     }
 }
 
 pub(crate) fn run_sublist2(sh: &mut Shell, s: &Sublist2) {
+    if s.not {
+        sh.noerrexit += 1;
+    }
     if let Some(p) = &s.pipeline {
         run_pipeline(sh, p, false);
     }
     if s.not {
+        sh.noerrexit -= 1;
         sh.status = i32::from(sh.status == 0);
     }
 }
@@ -570,7 +642,29 @@ fn run_pipeline(sh: &mut Shell, p: &Pipeline, exec_last: bool) {
         return;
     }
     let mut prev: i32 = -1;
+    // In sh emulation -- not ksh's -- the last element is a child like the
+    // others, so `x | read v` leaves `v` unset as other sh's do (zsh's
+    // `execcmd_exec`, `last1 == 2 && EMULATION(EMULATE_SH)`).
+    let last_in_shell = sh.emulation != crate::options::Emulation::Sh;
     for (i, cmd) in p.cmds.iter().enumerate() {
+        if i + 1 == n && !last_in_shell {
+            let pid = spawn(sh, move |sh| {
+                if prev >= 0 {
+                    dup2(prev, 0);
+                    close(prev);
+                }
+                run_command(sh, cmd, true);
+                sh.status
+            });
+            if prev >= 0 {
+                close(prev);
+            }
+            if pid < 0 {
+                sh.error("fork failed");
+                sh.status = 1;
+            }
+            break;
+        }
         if i + 1 == n {
             // The last element runs in the shell, as in zsh: `x | read v`.
             // An external command forks from there and joins the job like
@@ -883,6 +977,23 @@ fn with_redirs(sh: &mut Shell, redirs: &[Redir], f: impl FnOnce(&mut Shell)) {
 /// that may exec in place.
 pub(crate) fn run_command(sh: &mut Shell, cmd: &Command, in_child: bool) {
     sh.lineno = cmd.lineno;
+    // A compound command run in the shell leaves its status as its own last
+    // list left it, for ERR_EXIT to judge; anything else is a status of its
+    // own.
+    if !matches!(
+        cmd.kind,
+        CmdKind::Cursh(_)
+            | CmdKind::Try { .. }
+            | CmdKind::For { .. }
+            | CmdKind::ForArith { .. }
+            | CmdKind::Select { .. }
+            | CmdKind::Case { .. }
+            | CmdKind::If { .. }
+            | CmdKind::While { .. }
+            | CmdKind::Repeat { .. }
+    ) {
+        sh.errexit_exempt = false;
+    }
     match &cmd.kind {
         CmdKind::Simple { assigns, words } => run_simple(sh, assigns, words, &cmd.redirs, in_child),
         CmdKind::Typeset {
@@ -1062,7 +1173,7 @@ pub(crate) fn assign_element(
         }
         Some(false) => {
             let text = expand_single(sh, sub)?;
-            let idx = crate::arith::eval(sh, &text)?;
+            let idx = crate::param::ksh_index(crate::arith::eval(sh, &text)?, sh);
             let Some(var) = sh.vars.get_mut(stored).filter(|v| !v.integer) else {
                 let mut arr = Vec::new();
                 set_index(&mut arr, idx, val, append)?;
@@ -1098,7 +1209,7 @@ pub(crate) fn assign_element(
                 _ => Vec::new(),
             };
             let text = expand_single(sh, sub)?;
-            let idx = crate::arith::eval(sh, &text)?;
+            let idx = crate::param::ksh_index(crate::arith::eval(sh, &text)?, sh);
             set_index(&mut arr, idx, val, append)?;
             sh.set_value(name, Value::Array(arr));
         }
@@ -1155,6 +1266,85 @@ fn set_index(arr: &mut Vec<Vec<u8>>, idx: i64, val: Vec<u8>, append: bool) -> Re
     Ok(())
 }
 
+/// XTRACE (`set -x`): `PS4`, expanded as a prompt, and then `line`, on
+/// standard error.
+fn xtrace(sh: &mut Shell, line: &[u8]) {
+    let ps4 = sh.get(b"PS4").map(|v| v.joined()).unwrap_or_default();
+    let mut out = crate::prompt::expand(sh, &ps4);
+    out.extend_from_slice(line);
+    out.push(b'\n');
+    let _ok = write_fd(2, &out);
+}
+
+/// A word as XTRACE shows it: as it is if nothing in it is special to the
+/// shell, otherwise single-quoted (zsh's `quotedzputs`).
+fn trace_word(w: &[u8], bang: bool) -> Vec<u8> {
+    let special = |c: u8| b"#$^*()=|{}[]`<>?~;&\n\t \\'\"".contains(&c) || (bang && c == b'!');
+    if !w.is_empty() && !w.iter().any(|&c| special(c)) {
+        return w.to_vec();
+    }
+    let mut out = vec![b'\''];
+    for &c in w {
+        if c == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push(b'\'');
+    out
+}
+
+/// An assignment as XTRACE shows it, from the value it left: `name=value `.
+fn trace_assign(sh: &Shell, name: &[u8]) -> Vec<u8> {
+    let base = name.split(|&c| c == tok::INBRACK).next().unwrap_or(name);
+    let mut out = tok::unmetafy(&tok::remove_nulls(name));
+    out.push(b'=');
+    match sh.get(base) {
+        Some(Value::Array(a)) if base.len() == name.len() => {
+            out.extend_from_slice(b"( ");
+            for e in &a {
+                out.extend(trace_word(&tok::unmetafy(e), sh.opt("banghist")));
+                out.push(b' ');
+            }
+            out.push(b')');
+        }
+        Some(v) if base.len() == name.len() => {
+            out.extend(trace_word(&tok::unmetafy(&v.joined()), sh.opt("banghist")));
+        }
+        _ => {}
+    }
+    out.push(b' ');
+    out
+}
+
+/// Whether the command `words` names would be run as a program rather than
+/// as a builtin or a function, judged from its words as written: the
+/// precommand modifiers are looked past, and `command` without options
+/// always means a program. A first word that needs expanding is not judged.
+fn runs_external(sh: &Shell, words: &[Vec<u8>]) -> bool {
+    let mut forced = false;
+    for w in words {
+        if w.iter()
+            .any(|&c| matches!(c, tok::STRING | tok::QSTRING | tok::TICK | tok::QTICK))
+        {
+            return false;
+        }
+        let name = word_text(w);
+        match name.as_slice() {
+            b"noglob" | b"nocorrect" | b"-" | b"exec" => {}
+            b"command" => forced = true,
+            _ if forced => return !name.starts_with(b"-"),
+            _ => {
+                return !sh.functions.contains_key(&name)
+                    && !sh.autoloads.contains(&name)
+                    && !crate::builtins::is_builtin(&name);
+            }
+        }
+    }
+    false
+}
+
 fn word_text(w: &[u8]) -> Vec<u8> {
     tok::remove_nulls(w)
 }
@@ -1202,17 +1392,35 @@ fn run_simple_body(
         Err(e) => {
             sh.error(&e);
             sh.status = 1;
-            sh.flow = Flow::Abort;
+            // zsh forks for an external command before it globs its
+            // arguments, so a pattern that matches nothing fails that
+            // command alone -- `rm -f *.log; echo next` goes on to `next`
+            // -- where in a builtin or a function it stops the script.
+            if sh.flow == Flow::Normal
+                && !(e.starts_with("no matches found") && runs_external(sh, words))
+            {
+                sh.flow = Flow::Abort;
+            }
             return;
         }
     };
     if args.is_empty() {
+        let mut traced = Vec::new();
         for a in assigns {
             if let Err(e) = assign(sh, a, false) {
                 sh.error(&e);
                 sh.status = 1;
+                if sh.flow == Flow::Normal {
+                    sh.flow = Flow::Abort;
+                }
                 return;
             }
+            if sh.opt("xtrace") {
+                traced.extend(trace_assign(sh, &a.name));
+            }
+        }
+        if sh.opt("xtrace") {
+            xtrace(sh, &traced);
         }
         match apply_redirs(sh, redirs) {
             Ok(saved) => restore_redirs(saved),
@@ -1225,6 +1433,23 @@ fn run_simple_body(
         // An assignment's status is its last command substitution's, or 0.
         sh.status = sh.subst_status.take().unwrap_or(0);
         return;
+    }
+    if sh.opt("xtrace") {
+        let mut line = Vec::new();
+        let bang = sh.opt("banghist");
+        for (k, a) in args.iter().enumerate() {
+            if k > 0 {
+                line.push(b' ');
+            }
+            // A builtin's trace names it as it is; its arguments, and every
+            // word of a program's, are quoted where they need it.
+            if k == 0 && crate::builtins::is_builtin(a) {
+                line.extend(tok::unmetafy(a));
+            } else {
+                line.extend(trace_word(&tok::unmetafy(a), bang));
+            }
+        }
+        xtrace(sh, &line);
     }
     let (mut use_functions, mut force_builtin, mut exec) = (true, false, false);
     loop {
@@ -1456,7 +1681,7 @@ fn exec_program(sh: &mut Shell, args: &[Vec<u8>]) -> ! {
                 .unwrap_or_default();
             sh.argzero = path;
             sh.positional = args.get(1..).unwrap_or(&[]).to_vec();
-            run_string(sh, &tok::metafy(&text));
+            run_file(sh, &tok::metafy(&text));
             exit_now(sh.status);
         }
         Some(libc::EACCES) => {
@@ -1494,7 +1719,17 @@ pub(crate) fn call_function(sh: &mut Shell, name: &[u8], args: Vec<Vec<u8>>) -> 
         return 1;
     }
     let saved_pos = std::mem::replace(&mut sh.positional, args);
-    let saved_zero = std::mem::replace(&mut sh.argzero, name.to_vec());
+    // `$0` is the function's name only under FUNCTION_ARGZERO, which sh
+    // emulation turns off: there it stays the script's.
+    let saved_zero = if sh.opt("functionargzero") {
+        std::mem::replace(&mut sh.argzero, name.to_vec())
+    } else {
+        sh.argzero.clone()
+    };
+    // The options as the function found them, for LOCAL_OPTIONS to put
+    // back -- `emulate -L zsh` at the top of a function is how most of
+    // zsh's own functions start.
+    let saved_options = (sh.options.clone(), sh.emulation);
     let saved_loops = std::mem::replace(&mut sh.loop_depth, 0);
     // An error in the body names the function and counts its line from the
     // definition, the way zsh reports one.
@@ -1513,6 +1748,10 @@ pub(crate) fn call_function(sh: &mut Shell, name: &[u8], args: Vec<Vec<u8>>) -> 
     sh.push_scope();
     run_list(sh, &f.body);
     sh.pop_scope();
+    // What a function returns is a status of its own to ERR_EXIT, however
+    // its last list came by it.
+    sh.errexit_exempt = false;
+    restore_options(sh, saved_options);
     if let Some((optind, optpos)) = saved_optind {
         if let Some(optind) = optind {
             sh.set_scalar(b"OPTIND", optind);
@@ -1528,6 +1767,45 @@ pub(crate) fn call_function(sh: &mut Shell, name: &[u8], args: Vec<Vec<u8>>) -> 
         sh.flow = Flow::Normal;
     }
     sh.status
+}
+
+/// What a function's return does to the options (zsh's `doshfunc`): with
+/// LOCAL_OPTIONS set as it returns, every option goes back to what it was
+/// when it was called, and the emulation with them; otherwise only the few
+/// options that are always the function's own.
+fn restore_options(
+    sh: &mut Shell,
+    saved: (
+        Rc<crate::shell::Table<String, bool>>,
+        crate::options::Emulation,
+    ),
+) {
+    let (mut options, emulation) = saved;
+    if sh.opt("localoptions") {
+        for keep in ["privileged", "restricted"] {
+            let now = sh.opt(keep);
+            if options.get(keep).copied().unwrap_or(false) != now {
+                let _old = Rc::make_mut(&mut options).insert(keep.to_owned(), now);
+            }
+        }
+        sh.options = options;
+        sh.emulation = emulation;
+        return;
+    }
+    // Changed only where they differ: most calls change no option at all,
+    // and then the options stay shared with the copy, not copied again.
+    for own in [
+        "xtrace",
+        "printexitvalue",
+        "localoptions",
+        "localloops",
+        "warnnestedvar",
+    ] {
+        let then = options.get(own).copied().unwrap_or(false);
+        if sh.opt(own) != then {
+            let _old = sh.options_mut().insert(own.to_owned(), then);
+        }
+    }
 }
 
 /// Handle `break`/`continue` at the end of one loop iteration. Returns true
@@ -1567,9 +1845,14 @@ fn run_compound(sh: &mut Shell, kind: &CmdKind) {
         ($e:expr) => {
             match $e {
                 Ok(v) => v,
+                // An expansion that fails ends the command list, as zsh's
+                // `errflag` does, whatever command it was in.
                 Err(msg) => {
                     sh.error(&msg);
                     sh.status = 1;
+                    if sh.flow == Flow::Normal {
+                        sh.flow = Flow::Abort;
+                    }
                     return;
                 }
             }
@@ -1608,6 +1891,10 @@ fn run_compound(sh: &mut Shell, kind: &CmdKind) {
                 for (k, var) in vars.iter().enumerate() {
                     let name = word_text(var);
                     sh.set_scalar(&name, chunk.get(k).cloned().unwrap_or_default());
+                    if sh.opt("xtrace") {
+                        let line = trace_assign(sh, &name);
+                        xtrace(sh, line.strip_suffix(b" ").unwrap_or(&line));
+                    }
                 }
                 run_list(sh, body);
                 if loop_flow(sh) {
@@ -1680,7 +1967,7 @@ fn run_compound(sh: &mut Shell, kind: &CmdKind) {
             otherwise,
         } => {
             for (cond, body) in branches {
-                run_list(sh, cond);
+                run_condition(sh, cond);
                 if sh.flow != Flow::Normal {
                     return;
                 }
@@ -1698,7 +1985,7 @@ fn run_compound(sh: &mut Shell, kind: &CmdKind) {
             sh.loop_depth += 1;
             let mut last = 0;
             loop {
-                run_list(sh, cond);
+                run_condition(sh, cond);
                 if sh.flow != Flow::Normal {
                     let _stop = loop_flow(sh);
                     break;

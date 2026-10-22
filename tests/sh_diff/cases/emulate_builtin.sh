@@ -1,0 +1,2 @@
+emulate
+echo /nonexistent/*.q

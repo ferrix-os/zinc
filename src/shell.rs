@@ -125,7 +125,19 @@ pub(crate) struct Shell {
     pub(crate) status: i32,
     pub(crate) flow: Flow,
     pub(crate) loop_depth: u32,
-    pub(crate) options: Table<String, bool>,
+    /// Shared with the copy a function call keeps for LOCAL_OPTIONS, so
+    /// that keeping it costs nothing until an option changes.
+    pub(crate) options: Rc<Table<String, bool>>,
+    /// The shell being emulated, which decides what the options' defaults
+    /// are and a few rules no option names.
+    pub(crate) emulation: crate::options::Emulation,
+    /// Above zero while ERR_EXIT must not act: in an `if` or loop
+    /// condition, and in the parts of an `&&`/`||` list before the last.
+    pub(crate) noerrexit: u32,
+    /// Whether the status in `$?` came from a part of an `&&`/`||` list
+    /// that was not its last, or from a `!` pipeline, which ERR_EXIT lets
+    /// pass even after the list (zsh's `this_noerrexit`).
+    pub(crate) errexit_exempt: bool,
     pub(crate) interactive: bool,
     pub(crate) pid: i32,
     pub(crate) last_bg: i32,
@@ -254,60 +266,15 @@ pub(crate) fn option_key(name: &[u8]) -> String {
         .collect()
 }
 
-/// The options zsh has on by default in native mode.
-const DEFAULT_ON: &[&str] = &[
-    "aliases",
-    "alwayslastprompt",
-    "appendhistory",
-    "autolist",
-    "automenu",
-    "autoparamkeys",
-    "autoparamslash",
-    "autoremoveslash",
-    "badpattern",
-    "banghist",
-    "bareglobqual",
-    "beep",
-    "bgnice",
-    "caseglob",
-    "casematch",
-    "checkjobs",
-    "checkrunningjobs",
-    "clobber",
-    "debugbeforecmd",
-    "equals",
-    "evallineno",
-    "exec",
-    "flowcontrol",
-    "functionargzero",
-    "glob",
-    "globalexport",
-    "globalrcs",
-    "hashcmds",
-    "hashdirs",
-    "hashlistall",
-    "histbeep",
-    "histsavebycopy",
-    "hup",
-    "listambiguous",
-    "listbeep",
-    "listtypes",
-    "multibyte",
-    "multifuncdef",
-    "multios",
-    "nomatch",
-    "notify",
-    "promptcr",
-    "promptpercent",
-    "promptsp",
-    "rcs",
-    "shortloops",
-    "unset",
-];
-
 impl Shell {
     /// A shell with zsh's defaults, the environment imported and exported.
     pub(crate) fn new(name: String) -> Shell {
+        Shell::emulating(name, crate::options::Emulation::Zsh)
+    }
+
+    /// A shell started in `emulation`, with that shell's option defaults,
+    /// as zsh starts as `sh` or with `--emulate sh`.
+    pub(crate) fn emulating(name: String, emulation: crate::options::Emulation) -> Shell {
         let mut vars = Table::default();
         for (k, v) in std::env::vars_os() {
             use std::os::unix::ffi::OsStrExt;
@@ -315,7 +282,9 @@ impl Shell {
             var.export = true;
             let _old = vars.insert(crate::tok::metafy(k.as_bytes()), var);
         }
-        let options = DEFAULT_ON.iter().map(|o| ((*o).to_owned(), true)).collect();
+        let mut options = Table::default();
+        crate::options::install(&mut options, emulation, true);
+        let options = Rc::new(options);
         // SAFETY: getpid has no preconditions.
         let pid = unsafe { libc::getpid() };
         let mut sh = Shell {
@@ -333,6 +302,9 @@ impl Shell {
             flow: Flow::Normal,
             loop_depth: 0,
             options,
+            emulation,
+            noerrexit: 0,
+            errexit_exempt: false,
             interactive: false,
             pid,
             last_bg: 0,
@@ -431,19 +403,40 @@ impl Shell {
         self.options.get(name).copied().unwrap_or(false)
     }
 
-    /// Set or unset an option by any spelling (`NO_` prefixes invert).
-    /// Returns false for an unknown name.
-    pub(crate) fn set_option(&mut self, name: &[u8], on: bool) -> bool {
-        let mut key = option_key(name);
-        let mut on = on;
-        if let Some(rest) = key.strip_prefix("no")
-            && !matches!(key.as_str(), "notify" | "nomatch")
-        {
-            key = rest.to_owned();
-            on = !on;
+    /// The options, to change: copied first if a function call is keeping
+    /// them as they were.
+    pub(crate) fn options_mut(&mut self) -> &mut Table<String, bool> {
+        Rc::make_mut(&mut self.options)
+    }
+
+    /// Whether the option `name`, spelt any way zsh accepts, is in effect:
+    /// `[[ -o name ]]`.
+    pub(crate) fn opt_named(&self, name: &[u8]) -> bool {
+        match crate::options::lookup(name) {
+            Some((key, invert)) => self.opt(key) != invert,
+            None => self.opt(&option_key(name)),
         }
-        let _old = self.options.insert(key, on);
+    }
+
+    /// Set or unset an option by any spelling (`NO_` prefixes and the other
+    /// shells' names included). Returns false for an unknown name, which is
+    /// still recorded under its own spelling.
+    pub(crate) fn set_option(&mut self, name: &[u8], on: bool) -> bool {
+        let Some((key, invert)) = crate::options::lookup(name) else {
+            let _old = self.options_mut().insert(option_key(name), on);
+            return false;
+        };
+        let _old = self.options_mut().insert(key.to_owned(), on != invert);
         true
+    }
+
+    /// `emulate name`: the options of the shell `name` asks for, every one
+    /// of them with `fully` (`emulate -R`, and starting up), otherwise the
+    /// ones zsh counts as belonging to an emulation.
+    pub(crate) fn emulate(&mut self, name: &[u8], fully: bool) {
+        let emulation = crate::options::Emulation::from_name(name);
+        crate::options::install(self.options_mut(), emulation, fully);
+        self.emulation = emulation;
     }
 
     /// `$commands`: every external command on `$PATH`, by the name that
@@ -493,7 +486,7 @@ impl Shell {
     /// a few system calls and costing a few hundred.
     ///
     /// [`commands`]: Shell::commands
-    fn command_path(&self, name: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn command_path(&self, name: &[u8]) -> Option<Vec<u8>> {
         // A directory listing never names anything with a slash in it, nor
         // anything empty, so neither is ever a key of the whole table.
         if name.is_empty() || name.contains(&b'/') {
@@ -629,11 +622,10 @@ impl Shell {
             }
             b"commands" => return Some(Value::Assoc(self.commands())),
             b"-" => {
-                return Some(Value::Scalar(if self.interactive {
-                    b"i".to_vec()
-                } else {
-                    Vec::new()
-                }));
+                return Some(Value::Scalar(crate::options::dash(
+                    &self.options,
+                    self.opt("shoptionletters"),
+                )));
             }
             b"UID" | b"EUID" | b"GID" | b"EGID" => return Some(Value::Scalar(id_of(name))),
             b"aliases" => {
@@ -872,18 +864,26 @@ impl Shell {
     fn report(&self, nam: Option<&str>, msg: &str) {
         use std::io::Write;
         // The file being run names the error, as zsh names it; the shell
-        // itself names what it read from its own input.
+        // itself names what it read from its own input -- as `zsh`, under
+        // whatever name it was started -- and on its own standard input
+        // with no line number, a builtin by its own name alone (zsh's
+        // `zwarning` and `zerrmsg`).
+        let stdin_top = self.opt("shinstdin") && self.script.is_empty();
         let mut who = if self.script.is_empty() {
             self.name.clone()
         } else {
             String::from_utf8_lossy(&crate::tok::unmetafy(&self.script)).into_owned()
         };
         if let Some(n) = nam {
-            who.push(':');
-            who.push_str(n);
+            if stdin_top {
+                who = n.to_owned();
+            } else {
+                who.push(':');
+                who.push_str(n);
+            }
         }
         let lineno = self.lineno.saturating_sub(self.line_base);
-        let line = if lineno == 0 || (self.interactive && self.script.is_empty()) {
+        let line = if lineno == 0 || stdin_top || (self.interactive && self.script.is_empty()) {
             format!("{who}: {msg}\n")
         } else {
             format!("{who}:{lineno}: {msg}\n")

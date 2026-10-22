@@ -18,17 +18,92 @@ pub(crate) struct Expansion {
     /// `${=spec}` split these fields at `$IFS`, so an empty one among them
     /// is a word of its own rather than an expansion that came to nothing.
     pub(crate) split: bool,
+    /// `${=spec}` or `${==spec}`: split at `$IFS` or not, whatever
+    /// SH_WORD_SPLIT says. `None` leaves it to the option.
+    pub(crate) word_split: Option<bool>,
+    /// `${~spec}` or `${~~spec}`: the value's characters are a pattern, or
+    /// are not, whatever GLOB_SUBST says. `None` leaves it to the option.
+    pub(crate) glob_subst: Option<bool>,
 }
 
 /// `$name`.
 pub(crate) fn expand_simple(sh: &mut Shell, name: &[u8], dq: bool) -> Result<Expansion, String> {
-    let value = sh.get(name).unwrap_or(Value::Scalar(Vec::new()));
+    let Some(value) = sh.get(name) else {
+        unset_error(sh, name)?;
+        return Ok(Expansion {
+            value: Value::Scalar(Vec::new()),
+            splat: !dq || name == b"@",
+            rc: sh.opt("rcexpandparam"),
+            split: false,
+            word_split: None,
+            glob_subst: None,
+        });
+    };
+    let value = ksh_first(sh, name, value);
     Ok(Expansion {
         value,
         splat: !dq || name == b"@",
         rc: sh.opt("rcexpandparam"),
         split: false,
+        word_split: None,
+        glob_subst: None,
     })
+}
+
+/// `set -u` (NO_UNSET): a parameter that is not set is an error where it
+/// is expanded, except the ones that are always there in some form.
+fn unset_error(sh: &Shell, name: &[u8]) -> Result<(), String> {
+    if sh.opt("unset")
+        || name.is_empty()
+        || matches!(name, b"@" | b"*" | b"#" | b"?" | b"$" | b"!" | b"-" | b"0")
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "{}: parameter not set",
+        String::from_utf8_lossy(&tok::unmetafy(name))
+    ))
+}
+
+/// An array index as written, counted from one as zsh counts: under
+/// KSH_ARRAYS the first element is 0, so one more is the zsh index. An
+/// index from the end is the same either way.
+pub(crate) fn ksh_index(index: i64, sh: &Shell) -> i64 {
+    if index >= 0 && sh.opt("ksharrays") {
+        index.saturating_add(1)
+    } else {
+        index
+    }
+}
+
+/// Whether the operator after a name gives an unset parameter a value of
+/// its own (`-`, `=`, `?`, `+`, with or without a colon), which is what
+/// keeps NO_UNSET quiet about it.
+fn defaults_unset(rest: &[u8]) -> bool {
+    let rest = match rest.first().map(|&c| tok::detok(c)) {
+        Some(b':') => rest.get(1..).unwrap_or(&[]),
+        _ => rest,
+    };
+    matches!(
+        rest.first().map(|&c| tok::detok(c)),
+        Some(b'-' | b'=' | b'?' | b'+')
+    )
+}
+
+/// Under KSH_ARRAYS an array named without a subscript is its first
+/// element, as `${a[0]}` is.
+fn ksh_first(sh: &Shell, name: &[u8], value: Value) -> Value {
+    match value {
+        Value::Array(a)
+            if sh.opt("ksharrays")
+                && name
+                    .first()
+                    .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'_' || c >= 0x80) =>
+        {
+            Value::Scalar(a.into_iter().next().unwrap_or_default())
+        }
+        other => other,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +128,10 @@ struct Flags {
     /// `${=spec}`: split the result into fields at `$IFS`, whether or not
     /// the expansion is quoted and whatever `SH_WORD_SPLIT` says.
     force_split: bool,
+    /// `=` or `==` before the name.
+    word_split: Option<bool>,
+    /// `~` or `~~` before the name.
+    glob_subst: Option<bool>,
     quote: u8,
     unquote: bool,
     indirect: bool,
@@ -191,11 +270,18 @@ pub(crate) fn expand_brace(sh: &mut Shell, inner: &[u8], dq: bool) -> Result<Exp
                 f.rc = Some(!off);
                 i += if off { 2 } else { 1 };
             }
+            // `==` turns the splitting off, as `~~` turns GLOB_SUBST off.
             Some(b'=') if next.is_some() => {
-                f.force_split = true;
-                i += 1;
+                let off = next.map(tok::detok) == Some(b'=');
+                f.force_split = !off;
+                f.word_split = Some(!off);
+                i += if off { 2 } else { 1 };
             }
-            Some(b'~') if next.is_some() => i += 1,
+            Some(b'~') if next.is_some() => {
+                let off = next.map(tok::detok) == Some(b'~');
+                f.glob_subst = Some(!off);
+                i += if off { 2 } else { 1 };
+            }
             _ => break,
         }
     }
@@ -274,13 +360,24 @@ pub(crate) fn expand_brace(sh: &mut Shell, inner: &[u8], dq: bool) -> Result<Exp
                 v = sh.get(&target.joined());
             }
             let set = v.is_some();
-            value = v;
+            value = v.map(|v| {
+                if subscripted {
+                    v
+                } else {
+                    ksh_first(sh, &name, v)
+                }
+            });
+            if !set && !isset && !defaults_unset(inner.get(i..).unwrap_or(&[])) {
+                unset_error(sh, &name)?;
+            }
             if !set && isset {
                 return Ok(Expansion {
                     value: Value::Scalar(b"0".to_vec()),
                     splat: false,
                     rc: false,
                     split: false,
+                    word_split: None,
+                    glob_subst: None,
                 });
             }
         }
@@ -301,6 +398,8 @@ pub(crate) fn expand_brace(sh: &mut Shell, inner: &[u8], dq: bool) -> Result<Exp
             splat: false,
             rc: false,
             split: false,
+            word_split: None,
+            glob_subst: None,
         });
     }
     let is_set = value.is_some();
@@ -334,6 +433,8 @@ pub(crate) fn expand_brace(sh: &mut Shell, inner: &[u8], dq: bool) -> Result<Exp
             splat: false,
             rc: false,
             split: false,
+            word_split: None,
+            glob_subst: None,
         });
     }
     v = map_elems(v, |s| {
@@ -413,6 +514,8 @@ pub(crate) fn expand_brace(sh: &mut Shell, inner: &[u8], dq: bool) -> Result<Exp
         splat,
         rc: f.rc.unwrap_or_else(|| sh.opt("rcexpandparam")),
         split: f.force_split,
+        word_split: f.word_split,
+        glob_subst: f.glob_subst,
     })
 }
 
@@ -626,9 +729,9 @@ fn eval_subscript(sh: &mut Shell, sub: &[u8], assoc: bool) -> Result<Sub, String
         ),
         None => (text, None),
     };
-    let lo = crate::arith::eval(sh, &a)?;
+    let lo = ksh_index(crate::arith::eval(sh, &a)?, sh);
     let hi = match b {
-        Some(b) => Some(crate::arith::eval(sh, &b)?),
+        Some(b) => Some(ksh_index(crate::arith::eval(sh, &b)?, sh)),
         None => None,
     };
     Ok(Sub::Index(lo, hi))
@@ -943,6 +1046,11 @@ fn apply_op(
                     } else {
                         w
                     };
+                    // Not only the command: a shell that is not
+                    // interactive leaves, from inside `eval` as well.
+                    if !sh.interactive {
+                        sh.flow = crate::shell::Flow::Exit;
+                    }
                     return Err(format!(
                         "{}: {}",
                         String::from_utf8_lossy(name),

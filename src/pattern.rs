@@ -5,7 +5,9 @@
 //! A subset of zsh's `pattern.c`; the rest (`(#i)`, `(#b)`) lands with the
 //! expansion milestone.
 
-use crate::tok::{BANG, BAR, BNULL, DASH, HAT, INANG, INBRACK, INPAR, META, OUTANG, OUTBRACK};
+use crate::tok::{
+    BANG, BAR, BNULL, BNULLKEEP, DASH, HAT, INANG, INBRACK, INPAR, META, OUTANG, OUTBRACK,
+};
 use crate::tok::{OUTPAR, POUND, QUEST, STAR, TILDE};
 
 /// One element of a compiled pattern.
@@ -168,7 +170,7 @@ impl Pattern {
 pub(crate) fn has_wildcards(pat: &[u8], extended: bool) -> bool {
     let mut i = 0;
     while let Some(&c) = pat.get(i) {
-        if c == META || c == BNULL {
+        if c == META || c == BNULL || c == BNULLKEEP {
             i += 2;
             continue;
         }
@@ -240,7 +242,10 @@ fn parse_alts(
                 *i += 1;
                 Node::Lit(n)
             }
-            BNULL => {
+            // BNULLKEEP is the backslash a GLOB_SUBST value quoted a
+            // wildcard with: the character is literal here, and the
+            // backslash stays in the word if nothing matches.
+            BNULL | BNULLKEEP => {
                 let n = pat.get(*i).copied().unwrap_or(b'\\');
                 *i += 1;
                 Node::Lit(n)
@@ -355,7 +360,7 @@ fn parse_class(pat: &[u8], i: &mut usize) -> Node {
                 continue;
             }
         }
-        let raw = if c == BNULL || c == META {
+        let raw = if c == BNULL || c == BNULLKEEP || c == META {
             *i += 1;
             let n = pat.get(*i).copied().unwrap_or(0);
             if c == META { n ^ 32 } else { n }

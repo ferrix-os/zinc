@@ -38,7 +38,8 @@ fn c_clusters_with_other_flags() {
     assert_eq!(zinc(&["-fc", "echo ran"]), ("ran\n".to_owned(), 0));
 }
 
+/// zsh says `zsh: string expected after -c` and exits 1.
 #[test]
 fn c_without_a_string_is_an_error() {
-    assert_eq!(zinc(&["-c"]).1, 2);
+    assert_eq!(zinc(&["-c"]).1, 1);
 }

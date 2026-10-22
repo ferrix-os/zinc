@@ -216,7 +216,7 @@ pub(crate) fn expand_single(sh: &mut Shell, w: &[u8]) -> Result<Vec<u8>, String>
         .into_iter()
         .map(|f| tok::remove_nulls(&f.bytes))
         .collect();
-    Ok(joined.join(&b' '))
+    Ok(joined.join(ifs_sep(sh).as_slice()))
 }
 
 /// Expand a pattern word, keeping wildcard tokens.
@@ -347,7 +347,7 @@ fn walk(sh: &mut Shell, w: &[u8], out: &mut Out, mut dq: bool) -> Result<(), Str
                     let inner = w.get(i + 1..end).unwrap_or(&[]).to_vec();
                     i = end + 1;
                     let r = param::expand_brace(sh, &inner, dq)?;
-                    insert_param(out, r, dq);
+                    insert_param_opts(sh, out, r, dq);
                 }
                 // `$#name` and `$+name`, which zsh reads as `${#name}` and
                 // `${+name}`: how long the parameter is, and whether it is
@@ -358,7 +358,7 @@ fn walk(sh: &mut Shell, w: &[u8], out: &mut Out, mut dq: bool) -> Result<(), Str
                     inner.extend_from_slice(&name);
                     i = take_subscript(w, i + 1 + len, &mut inner);
                     let r = param::expand_brace(sh, &inner, dq)?;
-                    insert_param(out, r, dq);
+                    insert_param_opts(sh, out, r, dq);
                 }
                 Some(n) if is_param_start(n) => {
                     let (name, len) = simple_name(w.get(i..).unwrap_or(&[]));
@@ -379,7 +379,7 @@ fn walk(sh: &mut Shell, w: &[u8], out: &mut Out, mut dq: bool) -> Result<(), Str
                         i = after;
                         param::expand_brace(sh, &inner, dq)?
                     };
-                    insert_param(out, r, dq);
+                    insert_param_opts(sh, out, r, dq);
                 }
                 _ => push_literal(out, b'$'),
             },
@@ -444,6 +444,37 @@ fn walk(sh: &mut Shell, w: &[u8], out: &mut Out, mut dq: bool) -> Result<(), Str
             // `remove_nulls` puts every leftover token back to its character.
             TILDE if sh.opt("extendedglob") && !dq && out.mode != Mode::Single => {
                 out.push_plain(&[c]);
+            }
+            // EQUALS: `=cmd` at the start of a word is the path of the
+            // program `cmd` (zsh's `filesubstr` and `equalsubstr`).
+            EQUALS
+                if i == 1
+                    && !dq
+                    && out.mode == Mode::Fields
+                    && w.get(i).is_some_and(|&n| n != INPAR)
+                    && sh.opt("equals") =>
+            {
+                let end = w
+                    .get(i..)
+                    .and_then(|r| r.iter().position(|&b| b == INPAR))
+                    .map_or(w.len(), |p| i + p);
+                let mut name = tok::remove_nulls(w.get(i..end).unwrap_or(&[]));
+                tok::untokenize(&mut name);
+                match sh.command_path(&tok::unmetafy(&name)) {
+                    Some(path) => {
+                        out.cur().expanded = true;
+                        out.cur().quoted = true;
+                        out.push_plain(&tok::metafy(&path));
+                        i = end;
+                    }
+                    None if sh.opt("nomatch") => {
+                        return Err(format!(
+                            "{} not found",
+                            String::from_utf8_lossy(&tok::unmetafy(&name))
+                        ));
+                    }
+                    None => push_literal(out, b'='),
+                }
             }
             EQUALS | COMMA | tok::DASH | tok::BANG | INBRACE | OUTBRACE | TILDE => {
                 push_literal(out, tok::detok(c));
@@ -528,7 +559,103 @@ fn simple_name(w: &[u8]) -> (Vec<u8>, usize) {
     (vec![first], 1)
 }
 
-fn insert_param(out: &mut Out, r: param::Expansion, dq: bool) {
+/// Insert a parameter's value as the options say: unquoted in a command's
+/// words, SH_WORD_SPLIT splits it at `$IFS`, and GLOB_SUBST makes its
+/// characters a pattern there and in a pattern word (zsh's `paramsubst`,
+/// `spbreak` and `globsubst`). `${=...}` and `${~...}` decide either one
+/// whatever the option.
+fn insert_param_opts(sh: &Shell, out: &mut Out, mut r: param::Expansion, dq: bool) {
+    if !dq
+        && out.mode == Mode::Fields
+        && !r.split
+        && r.word_split.unwrap_or_else(|| sh.opt("shwordsplit"))
+    {
+        let ifs = ifs(sh);
+        let words: Vec<Vec<u8>> = match r.value {
+            Value::Array(a) => a.iter().flat_map(|w| split_ifs(w, &ifs)).collect(),
+            other => split_ifs(&other.joined(), &ifs),
+        };
+        r.value = Value::Array(words);
+        r.splat = true;
+        r.split = true;
+    }
+    let subst =
+        !dq && out.mode != Mode::Single && r.glob_subst.unwrap_or_else(|| sh.opt("globsubst"));
+    if !subst {
+        insert_param(out, r, dq, &ifs_sep(sh));
+        return;
+    }
+    let shglob = sh.opt("shglob");
+    r.value = match r.value {
+        Value::Array(a) => Value::Array(a.iter().map(|w| glob_tokenize(w, shglob)).collect()),
+        Value::Scalar(w) => Value::Scalar(glob_tokenize(&w, shglob)),
+        other => other,
+    };
+    let start = out.fields.len().saturating_sub(1);
+    insert_param(out, r, dq, &ifs_sep(sh));
+    for f in out.fields.iter_mut().skip(start) {
+        f.glob = true;
+    }
+}
+
+/// A value's characters made into the pattern tokens they would be if
+/// typed, for GLOB_SUBST (zsh's `shtokenize`). A backslash before one of
+/// them quotes it and stays in the word; under SH_GLOB the parentheses and
+/// `|` are characters.
+fn glob_tokenize(w: &[u8], shglob: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w.len());
+    let mut i = 0;
+    while let Some(&c) = w.get(i) {
+        i += 1;
+        if c == META {
+            out.push(c);
+            if let Some(&n) = w.get(i) {
+                out.push(n);
+                i += 1;
+            }
+            continue;
+        }
+        let token = match c {
+            b'*' => Some(tok::STAR),
+            b'?' => Some(tok::QUEST),
+            b'[' => Some(INBRACK),
+            b']' => Some(OUTBRACK),
+            b'#' => Some(tok::POUND),
+            b'^' => Some(tok::HAT),
+            b'~' => Some(TILDE),
+            b'(' if !shglob => Some(INPAR),
+            b')' if !shglob => Some(OUTPAR),
+            b'|' if !shglob => Some(tok::BAR),
+            _ => None,
+        };
+        if c == b'\\'
+            && let Some(&n) = w.get(i)
+            && (matches!(n, b'*' | b'?' | b'[' | b']' | b'#' | b'^' | b'~' | b'\\')
+                || (!shglob && matches!(n, b'(' | b')' | b'|')))
+        {
+            out.push(tok::BNULLKEEP);
+            out.push(n);
+            i += 1;
+            continue;
+        }
+        out.push(token.unwrap_or(c));
+    }
+    out
+}
+
+/// What an array is joined with into one word: the first character of
+/// `$IFS`, a space when it is unset, nothing when it is empty (zsh's
+/// `sepjoin`). `"$*"` and an array in an assignment are both joined so.
+pub(crate) fn ifs_sep(sh: &Shell) -> Vec<u8> {
+    let ifs = ifs(sh);
+    match ifs.first() {
+        Some(&META) => ifs.get(..2).unwrap_or(&[]).to_vec(),
+        Some(&c) => vec![c],
+        None => Vec::new(),
+    }
+}
+
+fn insert_param(out: &mut Out, r: param::Expansion, dq: bool, sep: &[u8]) {
     match r.value {
         Value::Array(a) if r.splat => {
             // An empty element is no word -- unless a split at IFS made it,
@@ -552,6 +679,7 @@ fn insert_param(out: &mut Out, r: param::Expansion, dq: bool) {
                 out.push_values_split(&vals, dq, r.split);
             }
         }
+        Value::Array(a) => out.push_values(&[a.join(sep)], dq),
         other => {
             let s = other.joined();
             out.push_values(&[s], dq);
@@ -570,8 +698,20 @@ fn insert_output(sh: &Shell, out: &mut Out, raw: &[u8], dq: bool) {
         out.push_values(&[text], true);
         return;
     }
-    let words = split_ifs(&text, &ifs(sh));
+    let mut words = split_ifs(&text, &ifs(sh));
+    // GLOB_SUBST: what a command printed is a pattern too.
+    let subst = sh.opt("globsubst");
+    if subst {
+        let shglob = sh.opt("shglob");
+        words = words.iter().map(|w| glob_tokenize(w, shglob)).collect();
+    }
+    let start = out.fields.len().saturating_sub(1);
     out.push_values_split(&words, false, true);
+    if subst {
+        for f in out.fields.iter_mut().skip(start) {
+            f.glob = true;
+        }
+    }
 }
 
 /// `$IFS`, or the three characters it stands for when it has never been set.

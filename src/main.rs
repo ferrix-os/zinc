@@ -20,6 +20,7 @@ mod input;
 mod jobs;
 mod lex;
 mod lexword;
+mod options;
 mod param;
 mod parse;
 mod parsectl;
@@ -195,11 +196,170 @@ fn reap(sh: &mut Shell) {
 
 fn source_if_exists(sh: &mut Shell, path: &[u8]) {
     if let Ok(text) = std::fs::read(String::from_utf8_lossy(path).as_ref()) {
-        exec::run_string(sh, &tok::metafy(&text));
+        exec::run_file(sh, &tok::metafy(&text));
         if sh.flow == Flow::Exit {
             finish(sh);
         }
         sh.flow = Flow::Normal;
+    }
+}
+
+/// The name zsh goes by, which decides its emulation: the last part of
+/// `argv[0]` without a leading `-`, and for `su`, which starts the shell
+/// under its own name, the shell `$SHELL` names (zsh's `zsh_main`).
+fn zsh_name(argv0: &[u8]) -> Vec<u8> {
+    let base = |path: &[u8]| -> Vec<u8> {
+        let last = path.rsplit(|&c| c == b'/').next().unwrap_or(b"zinc");
+        last.strip_prefix(b"-").unwrap_or(last).to_vec()
+    };
+    let name = base(argv0);
+    if name == b"su"
+        && let Some(shell) = std::env::var_os("SHELL")
+    {
+        let shell = shell.as_bytes();
+        if !shell.is_empty() && shell != argv0 {
+            return base(shell);
+        }
+    }
+    name
+}
+
+/// What the command line asked for besides options.
+#[derive(Debug)]
+struct Invocation {
+    /// `-c`: the first operand is the command.
+    command: bool,
+    /// Where the operands begin in `argv`.
+    operands: usize,
+}
+
+/// Read the options on the command line into `sh`, as zsh's `parseopts`
+/// does at the top level. The emulation is installed before the first
+/// option is set -- by `--emulate`, or else by the shell's name -- so that
+/// `sh -o nomatch` ends with the option on. `Err(None)` is a clean exit
+/// (`--version`), `Err(Some(message))` a refusal.
+fn parse_options(
+    sh: &mut Shell,
+    args: &[Vec<u8>],
+    name: &[u8],
+) -> Result<Invocation, Option<String>> {
+    let mut emulation: Option<Vec<u8>> = Some(name.to_vec());
+    let install = |sh: &mut Shell, emulation: &mut Option<Vec<u8>>| {
+        if let Some(name) = emulation.take() {
+            sh.emulate(&name, true);
+        }
+    };
+    let mut command = false;
+    let mut k = 1;
+    'args: while let Some(a) = args.get(k) {
+        let on = match a.first() {
+            Some(b'-') => true,
+            Some(b'+') => false,
+            _ => break,
+        };
+        k += 1;
+        // A lone `-` ends the options, as `--` does.
+        if a.len() == 1 || a.as_slice() == b"--" {
+            break;
+        }
+        if on && a.get(1) == Some(&b'-') {
+            let long = a.get(2..).unwrap_or(&[]);
+            match long {
+                b"version" => {
+                    let _ok = exec::write_fd(1, b"zsh 5.9 (zinc)\n");
+                    return Err(None);
+                }
+                b"tokens" | b"ast" => {
+                    let file = args.get(k).cloned().unwrap_or_default();
+                    let Ok(text) = std::fs::read(String::from_utf8_lossy(&file).as_ref()) else {
+                        return Err(Some("cannot read file".to_owned()));
+                    };
+                    if long == b"tokens" {
+                        dump_tokens(sh, &text);
+                        return Err(None);
+                    }
+                    exec::exit_now(dump_ast(sh, &text));
+                }
+                b"emulate" => {
+                    let Some(mode) = args.get(k) else {
+                        return Err(Some("--emulate: argument required".to_owned()));
+                    };
+                    if emulation.is_none() {
+                        return Err(Some("--emulate: must precede other options".to_owned()));
+                    }
+                    emulation = Some(mode.clone());
+                    k += 1;
+                }
+                _ => {
+                    install(sh, &mut emulation);
+                    let option: Vec<u8> = long
+                        .iter()
+                        .map(|&c| if c == b'-' { b'_' } else { c })
+                        .collect();
+                    if !sh.set_option(&option, true) {
+                        return Err(Some(format!(
+                            "no such option: {}",
+                            String::from_utf8_lossy(&option)
+                        )));
+                    }
+                }
+            }
+            continue;
+        }
+        let mut letters = a.iter().skip(1);
+        while let Some(&c) = letters.next() {
+            // `-b` ends the options after this argument -- unless the sh
+            // letters are in use, where it is `notify`. Before any option
+            // has installed the emulation, they are not, which is zsh's
+            // order too.
+            let sh_letters = emulation.is_none() && sh.opt("shoptionletters");
+            if c == b'b' && !sh_letters {
+                install(sh, &mut emulation);
+                for &c in letters.by_ref() {
+                    set_letter(sh, c, on)?;
+                }
+                break 'args;
+            }
+            install(sh, &mut emulation);
+            match c {
+                b'c' => command = true,
+                b'o' => {
+                    let rest: Vec<u8> = letters.by_ref().copied().collect();
+                    let option = if rest.is_empty() {
+                        let Some(next) = args.get(k) else {
+                            return Err(Some("string expected after -o".to_owned()));
+                        };
+                        k += 1;
+                        next.clone()
+                    } else {
+                        rest
+                    };
+                    if !sh.set_option(&option, on) {
+                        return Err(Some(format!(
+                            "no such option: {}",
+                            String::from_utf8_lossy(&option)
+                        )));
+                    }
+                }
+                _ => set_letter(sh, c, on)?,
+            }
+        }
+    }
+    install(sh, &mut emulation);
+    Ok(Invocation {
+        command,
+        operands: k,
+    })
+}
+
+/// One option letter on the command line.
+fn set_letter(sh: &mut Shell, c: u8, on: bool) -> Result<(), Option<String>> {
+    match options::letter(c, sh.opt("shoptionletters")) {
+        Some((option, invert)) => {
+            let _ok = sh.set_option(option.as_bytes(), on != invert);
+            Ok(())
+        }
+        None => Err(Some(format!("bad option: -{}", char::from(c)))),
     }
 }
 
@@ -210,72 +370,50 @@ fn main() {
     let _old = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<Vec<u8>> = std::env::args_os().map(|a| a.as_bytes().to_vec()).collect();
     let argv0 = args.first().cloned().unwrap_or_else(|| b"zinc".to_vec());
-    let base = argv0
-        .rsplit(|&c| c == b'/')
-        .next()
-        .unwrap_or(b"zinc")
-        .to_vec();
-    let base = base.strip_prefix(b"-").unwrap_or(&base).to_vec();
-    let name = if base == b"zinc" {
-        "zsh".to_owned()
-    } else {
-        String::from_utf8_lossy(&base).into_owned()
-    };
-    let mut sh = Shell::new(name);
+    let base = zsh_name(&argv0);
+    // Messages name the shell `zsh` whatever it was started as, as zsh's
+    // do once it is running; only the ones about its own command line name
+    // it as it was run.
+    let mut sh = Shell::new("zsh".to_owned());
+    let argv0_shown = String::from_utf8_lossy(&argv0).into_owned();
+    if base != b"zinc" {
+        sh.set_scalar(b"ZSH_NAME", tok::metafy(&base));
+    }
     sh.argzero = tok::metafy(&argv0);
-
-    // `-c` is a flag: the command is the first operand after the options,
-    // so that `sh -c -- 'cmd'` -- what glibc's `system` and `popen` run --
-    // and `sh -ec 'cmd'` both find it, as POSIX and zsh do.
-    let mut run_command = false;
-    let mut force_interactive = false;
-    let mut no_rcs = false;
     // A login shell: `-l`, or a name beginning with `-`, which is how
     // `login` and `su -` start one.
-    let mut login = argv0
+    let login_name = argv0
         .rsplit(|&c| c == b'/')
         .next()
         .is_some_and(|name| name.first() == Some(&b'-'));
-    let mut k = 1;
-    while let Some(a) = args.get(k) {
-        match a.as_slice() {
-            b"--tokens" | b"--ast" => {
-                let file = args.get(k + 1).cloned().unwrap_or_default();
-                let Ok(text) = std::fs::read(String::from_utf8_lossy(&file).as_ref()) else {
-                    sh.error("cannot read file");
-                    exec::exit_now(1);
-                };
-                if a == b"--tokens" {
-                    dump_tokens(&sh, &text);
-                    exec::exit_now(0);
-                }
-                exec::exit_now(dump_ast(&sh, &text));
-            }
-            b"--version" => {
-                let _ok = exec::write_fd(1, b"zsh 5.9 (zinc)\n");
-                exec::exit_now(0);
-            }
-            b"--" => {
-                k += 1;
-                break;
-            }
-            _ if a.first() == Some(&b'-') && a.len() > 1 => {
-                for &c in a.iter().skip(1) {
-                    match c {
-                        b'c' => run_command = true,
-                        b'i' => force_interactive = true,
-                        b'l' => login = true,
-                        b'f' => no_rcs = true,
-                        b'x' => drop(sh.set_option(b"xtrace", true)),
-                        b'e' => drop(sh.set_option(b"errexit", true)),
-                        _ => {}
-                    }
-                }
-                k += 1;
-            }
-            _ => break,
+    let opts = match parse_options(&mut sh, &args, &base) {
+        Ok(opts) => opts,
+        Err(Some(message)) => {
+            let _ok = exec::write_fd(2, format!("{argv0_shown}: {message}\n").as_bytes());
+            exec::exit_now(1);
         }
+        Err(None) => exec::exit_now(0),
+    };
+    // PS4 as the emulation has it: zsh's names the script and line, the
+    // Bourne shells' is a plus.
+    if std::env::var_os("PS4").is_none() {
+        let ps4: &[u8] = if sh.emulation.bourne() {
+            b"+ "
+        } else {
+            b"+%N:%i> "
+        };
+        sh.set_scalar(b"PS4", ps4.to_vec());
     }
+    let k = opts.operands;
+    let run_command = opts.command;
+    let force_interactive = sh.opt("interactive");
+    let login = login_name || sh.opt("login");
+    let _old = sh.options_mut().insert("login".to_owned(), login);
+    let no_rcs = !sh.opt("rcs");
+    // zsh hashes directories by default only in an interactive shell.
+    let _old = sh
+        .options_mut()
+        .insert("hashdirs".to_owned(), force_interactive);
     let mut rest: Vec<Vec<u8>> = args
         .get(k..)
         .unwrap_or(&[])
@@ -283,8 +421,11 @@ fn main() {
         .map(|a| tok::metafy(a))
         .collect();
     if run_command && rest.is_empty() {
-        sh.error("-c: string expected");
-        exec::exit_now(2);
+        let _ok = exec::write_fd(
+            2,
+            format!("{}: string expected after -c\n", sh.name).as_bytes(),
+        );
+        exec::exit_now(1);
     }
     let command = run_command.then(|| rest.remove(0));
 
@@ -296,29 +437,45 @@ fn main() {
         exec::run_string(&mut sh, &cmd);
         finish(&mut sh);
     }
+    // `-s`: the commands come from standard input whatever the operands
+    // are, which become the positional parameters.
+    let from_stdin = sh.opt("shinstdin");
+    if from_stdin {
+        sh.positional = std::mem::take(&mut rest);
+    }
     if let Some((file, pos)) = rest.split_first() {
         sh.argzero = file.clone();
         sh.positional = pos.to_vec();
         let Ok(text) = std::fs::read(String::from_utf8_lossy(&tok::unmetafy(file)).as_ref()) else {
-            sh.error(&format!(
-                "can't open input file: {}",
+            let message = format!(
+                "{argv0_shown}: can't open input file: {}\n",
                 String::from_utf8_lossy(&tok::unmetafy(file))
-            ));
+            );
+            let _ok = exec::write_fd(2, message.as_bytes());
             exec::exit_now(127);
         };
         sh.script = file.clone();
-        exec::run_string(&mut sh, &tok::metafy(&text));
+        exec::run_file(&mut sh, &tok::metafy(&text));
         finish(&mut sh);
     }
     // SAFETY: isatty has no memory-safety preconditions.
     let tty = unsafe { libc::isatty(0) } == 1;
     sh.interactive = force_interactive || tty;
+    // What `$-` and `setopt` show of how the shell was started.
+    for (option, on) in [
+        ("interactive", sh.interactive),
+        ("monitor", sh.interactive),
+        ("shinstdin", true),
+        ("hashdirs", sh.interactive),
+    ] {
+        let _old = sh.options_mut().insert(option.to_owned(), on);
+    }
     if !sh.interactive {
         let mut text = Vec::new();
         while let Some(line) = read_line() {
             text.extend(line);
         }
-        exec::run_string(&mut sh, &tok::metafy(&text));
+        exec::run_file(&mut sh, &tok::metafy(&text));
         finish(&mut sh);
     }
     // Job control, before the signals below are ignored: taking the terminal
@@ -339,7 +496,21 @@ fn main() {
         // SAFETY: SIG_IGN is a valid disposition for these signals.
         let _old = unsafe { libc::signal(sig, libc::SIG_IGN) };
     }
-    if !no_rcs {
+    if sh.emulation.bourne() {
+        // As sh or ksh, zsh reads what those shells read: the profiles for
+        // a login shell, and `$ENV` for an interactive one.
+        if login {
+            source_if_exists(&mut sh, b"/etc/profile");
+            if let Some(home) = sh.get(b"HOME").map(|v| tok::unmetafy(&v.joined())) {
+                source_if_exists(&mut sh, &[home.as_slice(), b"/.profile"].concat());
+            }
+        }
+        if let Some(env) = sh.get(b"ENV").map(|v| tok::unmetafy(&v.joined()))
+            && !env.is_empty()
+        {
+            source_if_exists(&mut sh, &env);
+        }
+    } else if !no_rcs {
         let dir = sh
             .get(b"ZDOTDIR")
             .or_else(|| sh.get(b"HOME"))

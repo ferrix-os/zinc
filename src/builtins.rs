@@ -184,7 +184,7 @@ pub(crate) fn run(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
         b"source" | b"." => source(sh, name, rest),
         b"eval" => {
             let text = rest.join(&b' ');
-            exec::run_string(sh, &text);
+            exec::eval_string(sh, &text);
             sh.status
         }
         b"test" => crate::cond::test(sh, rest),
@@ -206,28 +206,24 @@ pub(crate) fn run(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
             0
         }
         b"setopt" | b"unsetopt" => {
+            let set = name == b"setopt";
             if rest.is_empty() {
-                let mut on: Vec<&String> = sh
-                    .options
-                    .iter()
-                    .filter(|(_, v)| **v)
-                    .map(|(k, _)| k)
-                    .collect();
-                on.sort();
-                let text: String = on.iter().map(|k| format!("{k}\n")).collect();
-                return out(sh, 1, text.as_bytes());
+                return out(sh, 1, &list_changed_options(sh, set));
             }
+            let mut status = 0;
             for o in rest {
-                let _ok = sh.set_option(o, name == b"setopt");
+                if !sh.set_option(o, set) {
+                    let shown = String::from_utf8_lossy(&tok::unmetafy(o)).into_owned();
+                    sh.error_at(
+                        if set { "setopt" } else { "unsetopt" },
+                        &format!("no such option: {shown}"),
+                    );
+                    status = 1;
+                }
             }
-            0
+            status
         }
-        b"emulate" => {
-            if rest.is_empty() {
-                return out(sh, 1, b"zsh\n");
-            }
-            0
-        }
+        b"emulate" => emulate(sh, rest),
         b"type" | b"whence" | b"which" | b"where" => whence(sh, name, rest),
         b"command" => {
             if rest.first().is_some_and(|a| a == b"-v" || a == b"-V") {
@@ -1004,8 +1000,16 @@ fn set(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
             match c {
                 b'o' => {
                     k += 1;
-                    if let Some(o) = args.get(k) {
-                        let _ok = sh.set_option(o, on);
+                    let Some(o) = args.get(k) else {
+                        // `set -o` lists every option, `set +o` as the
+                        // commands that would set them back.
+                        return out(sh, 1, &list_all_options(sh, !on));
+                    };
+                    if !sh.set_option(o, on) {
+                        let shown = String::from_utf8_lossy(&tok::unmetafy(o)).into_owned();
+                        sh.error_at("set", &format!("no such option: {shown}"));
+                        sh.flow = Flow::Abort;
+                        return 1;
                     }
                 }
                 b'A' => {
@@ -1015,12 +1019,23 @@ fn set(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
                     }
                     return 0;
                 }
-                b'e' => drop(sh.set_option(b"errexit", on)),
-                b'x' => drop(sh.set_option(b"xtrace", on)),
-                b'u' => drop(sh.set_option(b"unset", !on)),
-                b'f' => drop(sh.set_option(b"glob", !on)),
-                b'v' => drop(sh.set_option(b"verbose", on)),
-                _ => {}
+                _ => match crate::options::letter(c, sh.opt("shoptionletters")) {
+                    Some((option, invert)) => {
+                        let _ok = sh.set_option(option.as_bytes(), on != invert);
+                    }
+                    None => {
+                        sh.error_at(
+                            "set",
+                            &format!(
+                                "bad option: {}{}",
+                                if on { '-' } else { '+' },
+                                char::from(c)
+                            ),
+                        );
+                        sh.flow = Flow::Abort;
+                        return 1;
+                    }
+                },
             }
         }
         k += 1;
@@ -1029,6 +1044,166 @@ fn set(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
         sh.positional = args.get(k..).unwrap_or(&[]).to_vec();
     }
     0
+}
+
+/// `setopt` or `unsetopt` with nothing to set: the options that differ from
+/// the emulation's defaults, or with `unsetopt` those that do not, each
+/// spelt the way that would set it as it is (zsh's `printoptionnode`).
+fn list_changed_options(sh: &Shell, set: bool) -> Vec<u8> {
+    let mut text = Vec::new();
+    for name in crate::options::names() {
+        let on = sh.opt(name);
+        let default = crate::options::default_in(name, sh.emulation);
+        if set == (on != default) {
+            if set != on {
+                text.extend_from_slice(b"no");
+            }
+            text.extend_from_slice(name.as_bytes());
+            text.push(b'\n');
+        }
+    }
+    text
+}
+
+/// `set -o`: every option and whether it is on, an option that is on by
+/// default named by its `no` form; `set +o`: the `set` commands that would
+/// put every option back as it is (zsh's `printoptionnodestate`).
+fn list_all_options(sh: &Shell, plus: bool) -> Vec<u8> {
+    let mut text = String::new();
+    for name in crate::options::names() {
+        let on = sh.opt(name);
+        let default = crate::options::default_in(name, sh.emulation);
+        let no = if default { "no" } else { "" };
+        if plus {
+            let sign = if default == on { '+' } else { '-' };
+            text.push_str(&format!("set {sign}o {no}{name}\n"));
+        } else if default {
+            text.push_str(&format!("no{name:<19} {}\n", if on { "off" } else { "on" }));
+        } else {
+            text.push_str(&format!("{name:<21} {}\n", if on { "on" } else { "off" }));
+        }
+    }
+    text.into_bytes()
+}
+
+/// `emulate`: with no arguments, the shell being emulated; with a name, that
+/// shell's option defaults (`-R` all of them, `-L` only until the function
+/// returns); with options and `-c` after the name, a command run in that
+/// emulation and the options as they were afterwards (zsh's `bin_emulate`).
+fn emulate(sh: &mut Shell, args: &[Vec<u8>]) -> i32 {
+    let (mut local, mut fully) = (false, false);
+    let mut k = 0;
+    while let Some(a) = args.get(k) {
+        if a.first() != Some(&b'-') || a.len() < 2 || a.as_slice() == b"--" {
+            if a.as_slice() == b"--" {
+                k += 1;
+            }
+            break;
+        }
+        for &c in a.iter().skip(1) {
+            match c {
+                b'L' => local = true,
+                b'R' => fully = true,
+                _ => {
+                    sh.error_at("emulate", &format!("bad option: -{}", char::from(c)));
+                    return 1;
+                }
+            }
+        }
+        k += 1;
+    }
+    let Some(mode) = args.get(k) else {
+        if local || fully {
+            sh.error_at("emulate", "not enough arguments");
+            return 1;
+        }
+        let text = format!("{}\n", sh.emulation.name());
+        return out(sh, 1, text.as_bytes());
+    };
+    let more = args.get(k + 1..).unwrap_or(&[]);
+    if more.is_empty() {
+        sh.emulate(mode, fully);
+        if local {
+            for option in ["localoptions", "localtraps", "localpatterns"] {
+                let _old = sh.options_mut().insert(option.to_owned(), true);
+            }
+        }
+        return 0;
+    }
+    // `emulate sh -o opt -c cmd`: the options after the name, then the
+    // command, then everything as it was.
+    let saved = (sh.options.clone(), sh.emulation);
+    sh.emulate(mode, fully);
+    if local {
+        for option in ["localoptions", "localtraps", "localpatterns"] {
+            let _old = sh.options_mut().insert(option.to_owned(), true);
+        }
+    }
+    let mut command: Option<&Vec<u8>> = None;
+    let mut j = 0;
+    let mut status = 0;
+    while let Some(a) = more.get(j) {
+        j += 1;
+        let on = match a.first() {
+            Some(b'-') => true,
+            Some(b'+') => false,
+            _ => {
+                let shown = String::from_utf8_lossy(&tok::unmetafy(a)).into_owned();
+                sh.error_at("emulate", &format!("unknown argument {shown}"));
+                status = 1;
+                break;
+            }
+        };
+        let mut letters = a.iter().skip(1);
+        while let Some(&c) = letters.next() {
+            match c {
+                b'c' => {
+                    command = more.get(j);
+                    j += 1;
+                }
+                b'o' => {
+                    let rest: Vec<u8> = letters.by_ref().copied().collect();
+                    let option = if rest.is_empty() {
+                        j += 1;
+                        more.get(j - 1).cloned().unwrap_or_default()
+                    } else {
+                        rest
+                    };
+                    if !sh.set_option(&option, on) {
+                        let shown = String::from_utf8_lossy(&tok::unmetafy(&option)).into_owned();
+                        sh.error_at("emulate", &format!("no such option: {shown}"));
+                        status = 1;
+                    }
+                }
+                _ => match crate::options::letter(c, sh.opt("shoptionletters")) {
+                    Some((option, invert)) => {
+                        let _ok = sh.set_option(option.as_bytes(), on != invert);
+                    }
+                    None => {
+                        sh.error_at("emulate", &format!("bad option: -{}", char::from(c)));
+                        status = 1;
+                    }
+                },
+            }
+        }
+        if status != 0 {
+            break;
+        }
+    }
+    if status == 0 {
+        match command {
+            Some(cmd) => {
+                exec::eval_string(sh, cmd);
+                status = sh.status;
+            }
+            None => {
+                sh.error_at("emulate", "string expected after -c");
+                status = 1;
+            }
+        }
+    }
+    (sh.options, sh.emulation) = saved;
+    status
 }
 
 /// `typeset` and relatives from the parser: words unexpanded, assignments
@@ -1206,7 +1381,7 @@ fn source(sh: &mut Shell, name: &[u8], args: &[Vec<u8>]) -> i32 {
     let outer = std::mem::replace(&mut sh.script, path.clone());
     let outer_line = sh.lineno;
     let outer_base = std::mem::replace(&mut sh.line_base, 0);
-    exec::run_string(sh, &tok::metafy(&text));
+    exec::run_file(sh, &tok::metafy(&text));
     sh.line_base = outer_base;
     sh.script = outer;
     sh.lineno = outer_line;
